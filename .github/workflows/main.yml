@@ -1,0 +1,30 @@
+name: Envcast Release
+
+on:
+    push:
+        tags:
+            - "v*"
+    workflow_dispatch:
+
+jobs:
+    dry-run-and-release:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Dry run envcast
+              run: |
+                  chmod +x main.sh
+                  ./main.sh --dry-run --file example-config.yml --secrets --repo ${{ github.repository }}
+
+            - name: Create Release
+              if: success()
+              uses: softprops/action-gh-release@v1
+              with:
+                  tag_name: ${{ github.ref_name }}
+                  name: Envcast ${{ github.ref_name }}
+                  body: |
+                      Automated release for envcast version ${{ github.ref_name }}
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

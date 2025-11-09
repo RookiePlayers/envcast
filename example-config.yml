@@ -1,0 +1,5 @@
+file: .env
+mode: secrets
+repo: RookiePlayers/ruki_utils
+prefix: DEV_
+verbose: true
