@@ -25,7 +25,8 @@ jobs:
                   fi
 
                   # Perform a dry run to verify the version
-                  envcast --version
+                  chmod +x ./main.sh &&
+                  ./main.sh --version
             - name: Create Release
               if: success()
               uses: softprops/action-gh-release@v1
