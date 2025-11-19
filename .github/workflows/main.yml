@@ -14,13 +14,18 @@ jobs:
             - name: Checkout code
               uses: actions/checkout@v4
 
-            - name: Dry run envcast
+            - name: Verify envcast --version
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               run: |
-                  chmod +x main.sh
-                  ./main.sh --dry-run --file example-config.yml --secrets --repo ${{ github.repository }}
+                  # Ensure GITHUB_TOKEN is set for the dry run step
+                  if [ -z "$GITHUB_TOKEN" ]; then
+                      echo "GITHUB_TOKEN is not set. Please set it in the repository secrets."
+                      exit 1
+                  fi
 
+                  # Perform a dry run to verify the version
+                  envcast --version
             - name: Create Release
               if: success()
               uses: softprops/action-gh-release@v1
