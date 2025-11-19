@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ======================================================================
 # envcast — cast .env values into GitHub Secrets or Variables via gh
-# Version: 1.1.1
+# Version: 1.2.0
 #
 # Behavior:
 #   - Non-interactive by default when required inputs are provided via flags
@@ -22,12 +22,20 @@
 #   select (true|false), dry_run (true|false), verbose (true|false),
 #   interactive (true|false)
 #
-# Precedence: CLI flags > config file values.
+# Multi-repo support:
+#   --repo can be:
+#     - a single value:        --repo owner/repo
+#     - a CSV list:            --repo owner/repo1,owner/repo2
+#     - repeated flags:        --repo owner/repo1 --repo owner/repo2
+#
+#   Config `repo` key can also be CSV; all repos are targeted.
+#
+# Precedence: CLI flags > config file values (for repos: config adds to flags).
 # ======================================================================
 
 set -Eeuo pipefail
 
-VERSION="1.1.1"
+VERSION="1.2.0"
 
 # ---------------------- Colors ----------------------
 if [[ -t 2 ]]; then
@@ -61,7 +69,8 @@ q() { # q "Question" ["Description"]
 INTERACTIVE="false"   # default: flags/config mode; wizard only if needed/requested
 FILE=""
 MODE=""
-REPO=""
+REPO=""              # first repo (for logs/back-compat)
+REPO_TARGETS=()      # all repo targets (may be >1)
 ORG=""
 ENV_NAME=""
 PREFIX=""
@@ -81,6 +90,25 @@ bool_from() {
   esac
 }
 
+add_repos_from_csv() {
+  # add_repos_from_csv "owner/repo1,owner/repo2"
+  local csv="$1"
+  local IFS=','
+  local arr
+  read -r -a arr <<< "$csv"
+  local r
+  for r in "${arr[@]}"; do
+    # trim spaces around each token
+    r="$(printf '%s' "$r" | sed -e 's/^[[:space:]]\+//' -e 's/[[:space:]]\+$//')"
+    [[ -z "$r" ]] && continue
+    REPO_TARGETS+=("$r")
+    # Keep REPO pointing to first target for logging/back-compat
+    if [[ -z "$REPO" ]]; then
+      REPO="$r"
+    fi
+  done
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --interactive) INTERACTIVE="true"; shift ;;
@@ -88,7 +116,10 @@ while [[ $# -gt 0 ]]; do
     -f|--file) FILE="${2:-}"; shift 2 ;;
     --secrets) MODE="secrets"; shift ;;
     --variables) MODE="variables"; shift ;;
-    --repo|-r) REPO="${2:-}"; shift 2 ;;
+    --repo|-r)
+      add_repos_from_csv "${2:-}"
+      shift 2
+      ;;
     --org) ORG="${2:-}"; shift 2 ;;
     -e|--env) ENV_NAME="${2:-}"; shift 2 ;;
     --prefix) PREFIX="${2:-}"; shift 2 ;;
@@ -103,7 +134,7 @@ ${CLR_BOLD}envcast${CLR_RESET} v$VERSION — cast .env values into GitHub Secret
 USAGE:
   envcast [-cf PATH] [--interactive]
           --file <.env> (--secrets | --variables)
-          [--repo OWNER/REPO | --org ORG] [--env NAME]
+          [--repo OWNER/REPO[,...] | --org ORG] [--env NAME]
           [--prefix STR] [--select] [--dry-run] [--verbose]
 
 FLAGS:
@@ -111,7 +142,7 @@ FLAGS:
   -f,  --file PATH           Path to .env to import
        --secrets             Write as GitHub Actions secrets (encrypted)
        --variables           Write as GitHub Actions variables (plain)
-  -r,  --repo OWNER/REPO     Target repository
+  -r,  --repo OWNER/REPO     Target repository (can be CSV or repeated flag)
        --org ORG             Target organization (if not repo)
   -e,  --env NAME            GitHub Environment name (staging, production, ...)
        --prefix STR          Prefix to apply for plain Actions scope (e.g. DEV_)
@@ -124,7 +155,10 @@ FLAGS:
 NOTES:
 - If --env is set, prefix is ignored.
 - Wizard runs only when required fields are missing or --interactive/--select is used.
-- Config precedence: CLI flags override config values.
+- Config precedence: CLI flags override config values (config can add more repos).
+- You can target multiple repos with:
+    --repo owner/repo1,owner/repo2
+    --repo owner/repo1 --repo owner/repo2
 EOF
       exit 0 ;;
     *) die "Unknown argument: $1" ;;
@@ -141,7 +175,7 @@ _set_from_cfg() {
   case "$k" in
     file)         FILE="$v" ;;
     mode)         MODE="$v" ;;
-    repo)         REPO="$v" ;;
+    repo)         add_repos_from_csv "$v" ;;  # may add multiple repos
     org)          ORG="$v" ;;
     env)          ENV_NAME="$v" ;;
     prefix)       PREFIX="$v" ;;
@@ -345,6 +379,7 @@ select_owner_and_repo() {
 
   local repo_choice; repo_choice="$(fzf_or_numbered "Repository" "${repos[@]}")"
   REPO="$repo_choice"
+  REPO_TARGETS=("$repo_choice")
   ORG="" # ensure org cleared if repo chosen
 }
 
@@ -414,28 +449,63 @@ parse_line() {
 is_valid_key() { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; }
 
 # ======================================================================
-#  Writer: calls gh secret/variable (quiet)
+#  Writer: calls gh secret/variable (quiet, multi-repo aware)
 # ======================================================================
 put_var() {
   local key="$1" val="$2"
-  local scope_flags=()
-  if [[ -n "$REPO" ]]; then scope_flags+=(--repo "$REPO"); else scope_flags+=(--org "$ORG"); fi
-  [[ -n "$ENV_NAME" ]] && scope_flags+=(--env "$ENV_NAME")
-
-  if [[ "$DRY_RUN" == "true" ]]; then
-    log "[dry-run] $MODE set $key ${scope_flags[*]}"
-    return 0
-  fi
 
   local envblock=(env GH_PROMPT_DISABLED=1 GH_NO_TTY=1)
 
-  if [[ "$MODE" == "secrets" ]]; then
-    # gh secret set reads value from stdin when --body is omitted
-    printf '%s' "$val" | "${envblock[@]}" gh secret set "$key" "${scope_flags[@]}" >/dev/null
+  local targets=()
+  local scope_type=""
+
+  if ((${#REPO_TARGETS[@]})); then
+    targets=("${REPO_TARGETS[@]}")
+    scope_type="repo"
   else
-    # gh variable set reliably supports --body
-    "${envblock[@]}" gh variable set "$key" "${scope_flags[@]}" --body "$val" >/dev/null
+    # org-scope single target
+    if [[ -z "$ORG" ]]; then
+      die "No --repo/--org configured while trying to set $key"
+    fi
+    targets=("$ORG")
+    scope_type="org"
   fi
+
+  local t
+  local rc=0
+
+  for t in "${targets[@]}"; do
+    local scope_flags=()
+    if [[ "$scope_type" == "repo" ]]; then
+      scope_flags+=(--repo "$t")
+    else
+      scope_flags+=(--org "$t")
+    fi
+    [[ -n "$ENV_NAME" ]] && scope_flags+=(--env "$ENV_NAME")
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+      log "[dry-run] $MODE set $key ${scope_flags[*]}"
+      continue
+    fi
+
+    if [[ "$MODE" == "secrets" ]]; then
+      if ! printf '%s' "$val" | "${envblock[@]}" gh secret set "$key" "${scope_flags[@]}" >/dev/null; then
+        log "✗ Failed to set $key for $t"
+        rc=1
+      fi
+    else
+      if ! "${envblock[@]}" gh variable set "$key" "${scope_flags[@]}" --body "$val" >/dev/null; then
+        log "✗ Failed to set $key for $t"
+        rc=1
+      fi
+    fi
+  done
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    return 0
+  fi
+
+  return "$rc"
 }
 
 # ======================================================================
@@ -466,7 +536,7 @@ process_env_file() {
     if put_var "$key" "$val"; then
       log "✓ $key"; ((count_set++))
     else
-      log "✗ Failed to set $key"; ((count_skip++))
+      ((count_skip++))
     fi
   done
   exec 3<&-
@@ -478,7 +548,7 @@ process_env_file() {
 # ======================================================================
 #  MAIN
 # ======================================================================
-# 1) Load config file first (so CLI flags can override)
+# 1) Load config file first (so CLI flags can add/override)
 if [[ -n "$CONFIG_FILE" ]]; then
   load_config_file "$CONFIG_FILE"
 fi
@@ -491,7 +561,7 @@ ensure_auth
 NEED_WIZ="false"
 if [[ "$INTERACTIVE" == "true" || "$SELECT_REPO" == "true" ]]; then
   NEED_WIZ="true"
-elif [[ -z "${MODE:-}" || -z "${FILE:-}" || ( -z "${REPO:-}" && -z "${ORG:-}" ) ]]; then
+elif [[ -z "${MODE:-}" || -z "${FILE:-}" || ( ${#REPO_TARGETS[@]} -eq 0 && -z "${ORG:-}" ) ]]; then
   NEED_WIZ="true"
 fi
 
@@ -499,24 +569,40 @@ if [[ "$NEED_WIZ" == "true" ]]; then
   ensure_fzf_available_if_wizard
   select_mode
   select_file
-  if [[ -z "$REPO" && -z "$ORG" ]] || [[ "$SELECT_REPO" == "true" ]]; then
+  if (( ${#REPO_TARGETS[@]} == 0 )) && [[ -z "$ORG" || "$SELECT_REPO" == "true" ]]; then
     select_owner_and_repo
   else
-    if [[ -n "$REPO" ]]; then gh repo view "$REPO" >/dev/null 2>&1 || die "Repository not accessible: $REPO"; fi
+    if ((${#REPO_TARGETS[@]})); then
+      local r
+      for r in "${REPO_TARGETS[@]}"; do
+        gh repo view "$r" >/dev/null 2>&1 || die "Repository not accessible: $r"
+      done
+    fi
   fi
   select_scope_and_prefix
 else
   # flags/config only: validate and go
   [[ -f "$FILE" ]] || die "File not found: $FILE"
-  if [[ -n "$REPO" && -n "$ORG" ]]; then die "Use either --repo or --org, not both."; fi
-  if [[ -n "$REPO" ]]; then gh repo view "$REPO" >/dev/null 2>&1 || die "Repository not accessible: $REPO"; fi
+  if (( ${#REPO_TARGETS[@]} )) && [[ -n "$ORG" ]]; then
+    die "Use either --repo/--repo CSV or --org, not both."
+  fi
+  if ((${#REPO_TARGETS[@]})); then
+    local r
+    for r in "${REPO_TARGETS[@]}"; do
+      gh repo view "$r" >/dev/null 2>&1 || die "Repository not accessible: $r"
+    done
+  fi
   # If environment selected, ignore prefix
   if [[ -n "$ENV_NAME" && -n "$PREFIX" ]]; then PREFIX=""; fi
 fi
 
 log "${CLR_BOLD}envcast v$VERSION${CLR_RESET}"
 log "-> file: $(realpath "$FILE")"
-[[ -n "$REPO" ]] && log "-> repo: $REPO"
+if ((${#REPO_TARGETS[@]} == 1)); then
+  log "-> repo: ${REPO_TARGETS[0]}"
+elif ((${#REPO_TARGETS[@]} > 1)); then
+  log "-> repos: ${REPO_TARGETS[*]}"
+fi
 [[ -n "$ORG"  ]] && log "-> org:  $ORG"
 [[ -n "$ENV_NAME" ]] && log "-> environment: $ENV_NAME"
 [[ -n "$PREFIX" ]] && log "-> prefix: $PREFIX"
